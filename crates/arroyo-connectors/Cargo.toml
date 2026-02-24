@@ -8,6 +8,7 @@ to_string_trait_impl = "allow"
 
 [features]
 default = []
+bq-storage = ["google-cloud-bigquery"]
 
 [dependencies]
 arroyo-types = { path = "../arroyo-types" }
@@ -46,6 +47,15 @@ schemars = "1.0.4"
 strum = "0.27"
 strum_macros = "0.27"
 sha2 = "0.10"
+
+# Google Cloud (Pub/Sub, BigQuery auth)
+google-cloud-pubsub = { version = "0.22", features = ["auth"] }
+google-cloud-auth = "0.14"
+tower = { version = "0.4", features = ["util"] }
+http = "0.2"
+google-cloud-bigquery = { version = "0.15", optional = true }
+google-cloud-googleapis = { version = "0.12", features = ["pubsub"] }
+google-cloud-token = "0.1"
 
 ##########################
 # connector dependencies #

@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "title": "BigQueryConfig",
+  "properties": {
+    "project_id": { "type": "string", "title": "Project ID" },
+    "endpoint": { "type": ["string", "null"], "title": "Custom Endpoint", "description": "Optional emulator or override endpoint" }
+  },
+  "required": ["project_id"]
+}
+
+

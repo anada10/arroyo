@@ -23,6 +23,7 @@ pub mod fluvio;
 pub mod impulse;
 pub mod kafka;
 pub mod kinesis;
+pub mod pubsub;
 pub mod mqtt;
 pub mod nats;
 pub mod nexmark;
@@ -35,6 +36,7 @@ pub mod sse;
 pub mod stdout;
 pub mod webhook;
 pub mod websocket;
+pub mod bigquery;
 
 pub fn connectors() -> HashMap<&'static str, Box<dyn ErasedConnector>> {
     let connectors: Vec<Box<dyn ErasedConnector>> = vec![
@@ -47,6 +49,7 @@ pub fn connectors() -> HashMap<&'static str, Box<dyn ErasedConnector>> {
         Box::new(impulse::ImpulseConnector {}),
         Box::new(kafka::KafkaConnector {}),
         Box::new(kinesis::KinesisConnector {}),
+        Box::new(pubsub::PubSubConnector {}),
         Box::new(mqtt::MqttConnector {}),
         Box::new(nats::NatsConnector {}),
         Box::new(nexmark::NexmarkConnector {}),
@@ -59,6 +62,7 @@ pub fn connectors() -> HashMap<&'static str, Box<dyn ErasedConnector>> {
         Box::new(stdout::StdoutConnector {}),
         Box::new(webhook::WebhookConnector {}),
         Box::new(websocket::WebsocketConnector {}),
+        Box::new(bigquery::BigQueryConnector {}),
     ];
 
     connectors.into_iter().map(|c| (c.name(), c)).collect()

@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "title": "PubSubTable",
+  "oneOf": [
+    {
+      "title": "Source",
+      "type": "object",
+      "properties": {
+        "type": { "const": "source" },
+        "subscription": { "type": "string", "title": "Subscription" }
+      },
+      "required": ["type", "subscription"],
+      "additionalProperties": false
+    },
+    {
+      "title": "Sink",
+      "type": "object",
+      "properties": {
+        "type": { "const": "sink" },
+        "topic": { "type": "string", "title": "Topic" }
+      },
+      "required": ["type", "topic"],
+      "additionalProperties": false
+    }
+  ]
+}
+
+

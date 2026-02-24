@@ -5,7 +5,6 @@ use ahash::HashSet;
 use anyhow::bail;
 use arrow_schema::{DataType, Field, Fields, TimeUnit};
 use arroyo_types::ArroyoExtensionType;
-use serde::__private::ser::FlatMapSerializer;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap};
@@ -242,7 +241,14 @@ impl Serialize for ListFieldItem {
     {
         let mut f = Serializer::serialize_map(s, None)?;
         f.serialize_entry("name", &self.name)?;
-        self.field_type.serialize(FlatMapSerializer(&mut f))?;
+        let field_type = serde_json::to_value(&self.field_type).map_err(serde::ser::Error::custom)?;
+        if let serde_json::Value::Object(map) = field_type {
+            for (k, v) in map {
+                f.serialize_entry(&k, &v)?;
+            }
+        } else {
+            return Err(serde::ser::Error::custom("field_type must serialize to an object"));
+        }
         f.serialize_entry("required", &self.required)?;
         f.serialize_entry("sql_name", &self.field_type.sql_type())?;
         f.end()
@@ -285,7 +291,14 @@ impl Serialize for SourceField {
     {
         let mut f = Serializer::serialize_map(s, None)?;
         f.serialize_entry("name", &self.name)?;
-        self.field_type.serialize(FlatMapSerializer(&mut f))?;
+        let field_type = serde_json::to_value(&self.field_type).map_err(serde::ser::Error::custom)?;
+        if let serde_json::Value::Object(map) = field_type {
+            for (k, v) in map {
+                f.serialize_entry(&k, &v)?;
+            }
+        } else {
+            return Err(serde::ser::Error::custom("field_type must serialize to an object"));
+        }
         f.serialize_entry("required", &self.required)?;
         if let Some(metadata_key) = &self.metadata_key {
             f.serialize_entry("metadata_key", metadata_key)?;
