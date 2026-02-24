@@ -3,6 +3,11 @@ use arroyo_operator::connector::{Connection, Connector};
 use arroyo_operator::operator::ConstructedOperator;
 use arroyo_rpc::api_types::connections::{ConnectionProfile, ConnectionSchema, ConnectionType, TestSourceMessage};
 use arroyo_rpc::{ConnectorOptions, OperatorConfig};
+use google_cloud_auth::credentials::CredentialsFile;
+use google_cloud_auth::project::Config as AuthConfig;
+use google_cloud_auth::token::DefaultTokenSourceProvider;
+use google_cloud_token::TokenSourceProvider;
+use reqwest::header::AUTHORIZATION;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
@@ -17,7 +22,9 @@ const ICON: &str = include_str!("./bigquery.svg");
 pub struct BigQueryConfig {
     pub project_id: String,
     #[serde(default)]
-    pub endpoint: Option<String>
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub service_account_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -68,13 +75,25 @@ impl Connector for BigQueryConnector {
     fn test(
         &self,
         _name: &str,
-        _config: Self::ProfileT,
-        _table: Self::TableT,
+        config: Self::ProfileT,
+        table: Self::TableT,
         _schema: Option<&ConnectionSchema>,
         tx: Sender<TestSourceMessage>,
     ) {
         tokio::spawn(async move {
-            let _ = tx.send(TestSourceMessage{ error: false, done: true, message: "Successfully validated BigQuery".into()}).await;
+            let msg = match test_connection(&config, &table).await {
+                Ok(message) => TestSourceMessage {
+                    error: false,
+                    done: true,
+                    message,
+                },
+                Err(e) => TestSourceMessage {
+                    error: true,
+                    done: true,
+                    message: format!("BigQuery validation failed: {e}"),
+                },
+            };
+            let _ = tx.send(msg).await;
         });
     }
 
@@ -134,7 +153,12 @@ impl BigQueryConnector {
     pub fn connection_from_options(options: &mut ConnectorOptions) -> anyhow::Result<BigQueryConfig> {
         let project_id = options.pull_str("project_id")?;
         let endpoint = options.pull_opt_str("endpoint")?;
-        Ok(BigQueryConfig { project_id, endpoint })
+        let service_account_json = options.pull_opt_str("service_account_json")?;
+        Ok(BigQueryConfig {
+            project_id,
+            endpoint,
+            service_account_json,
+        })
     }
 
     pub fn table_from_options(options: &mut ConnectorOptions) -> anyhow::Result<BigQueryTable> {
@@ -146,6 +170,78 @@ impl BigQueryConnector {
         let max_batch_rows = options.pull_opt_i64("max_batch_rows")?;
         let flush_interval_millis = options.pull_opt_i64("flush_interval_millis")?;
         Ok(BigQueryTable { dataset, table, use_storage_write, insert_id_field, max_batch_bytes, max_batch_rows, flush_interval_millis })
+    }
+}
+
+async fn create_token_provider(
+    config: &BigQueryConfig,
+) -> anyhow::Result<DefaultTokenSourceProvider> {
+    let auth_cfg = AuthConfig {
+        audience: None,
+        scopes: Some(&["https://www.googleapis.com/auth/bigquery"][..]),
+        ..Default::default()
+    };
+
+    if let Some(service_account_json) = config.service_account_json.as_deref() {
+        if !service_account_json.trim().is_empty() {
+            let credentials = CredentialsFile::new_from_str(service_account_json)
+                .await
+                .map_err(|e| anyhow!("invalid service account JSON: {e}"))?;
+            return DefaultTokenSourceProvider::new_with_credentials(auth_cfg, Box::new(credentials))
+                .await
+                .map_err(|e| anyhow!("failed to initialize auth with service account JSON: {e}"));
+        }
+    }
+
+    DefaultTokenSourceProvider::new(auth_cfg)
+        .await
+        .map_err(|e| anyhow!("failed to initialize ADC auth: {e}"))
+}
+
+async fn test_connection(config: &BigQueryConfig, table: &BigQueryTable) -> anyhow::Result<String> {
+    let provider = create_token_provider(config).await?;
+    let token = provider
+        .token_source()
+        .token()
+        .await
+        .map_err(|e| anyhow!("failed to fetch BigQuery access token: {e}"))?;
+
+    // During profile-only validation, table fields may not be provided yet.
+    if table.dataset.trim().is_empty() || table.table.trim().is_empty() {
+        return Ok("Authenticated to BigQuery successfully".into());
+    }
+
+    let base = config
+        .endpoint
+        .clone()
+        .unwrap_or_else(|| "https://bigquery.googleapis.com".to_string());
+    let url = format!(
+        "{}/bigquery/v2/projects/{}/datasets/{}/tables/{}",
+        base, config.project_id, table.dataset, table.table
+    );
+
+    let response = reqwest::Client::new()
+        .get(url)
+        .header(AUTHORIZATION, token)
+        .send()
+        .await
+        .map_err(|e| anyhow!("failed to call BigQuery API: {e}"))?;
+
+    if response.status().is_success() {
+        Ok(format!(
+            "Authenticated and verified table {}.{}",
+            table.dataset, table.table
+        ))
+    } else {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(anyhow!(
+            "BigQuery API returned {} while checking table {}.{}: {}",
+            status,
+            table.dataset,
+            table.table,
+            body
+        ))
     }
 }
 

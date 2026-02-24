@@ -8,6 +8,7 @@ use arroyo_rpc::errors::DataflowResult;
 use arroyo_rpc::grpc::rpc::TableConfig;
 use arroyo_types::CheckpointBarrier;
 use async_trait::async_trait;
+use google_cloud_auth::credentials::CredentialsFile;
 use google_cloud_auth::project::Config as AuthConfig;
 use google_cloud_auth::token::DefaultTokenSourceProvider;
 use google_cloud_token::TokenSourceProvider;
@@ -56,6 +57,7 @@ pub struct BigQuerySinkFunc {
     insert_id_field: Option<String>,
     client: Client,
     token_provider: Option<DefaultTokenSourceProvider>,
+    service_account_json: Option<String>,
     endpoint: Option<String>,
     serializer: ArrowSerializer,
     buffer: BatchBuffer,
@@ -72,6 +74,7 @@ impl BigQuerySinkFunc {
             insert_id_field: table.insert_id_field.clone(),
             client: Client::new(),
             token_provider: None,
+            service_account_json: cfg.service_account_json,
             endpoint: cfg.endpoint,
             serializer: ArrowSerializer::new(op.format.expect("format required")),
             buffer: BatchBuffer::new(),
@@ -179,9 +182,46 @@ impl ArrowOperator for BigQuerySinkFunc {
             scopes: Some(&["https://www.googleapis.com/auth/bigquery"][..]),
             ..Default::default()
         };
-        self.token_provider = Some(DefaultTokenSourceProvider::new(auth_cfg).await.map_err(|e| {
-            connector_err!(External, WithBackoff, "failed to initialize BigQuery auth: {e}")
-        })?);
+
+        let provider = if let Some(service_account_json) = self.service_account_json.as_deref() {
+            if !service_account_json.trim().is_empty() {
+                let credentials = CredentialsFile::new_from_str(service_account_json)
+                    .await
+                    .map_err(|e| {
+                        connector_err!(
+                            User,
+                            NoRetry,
+                            "invalid BigQuery service account JSON: {e}"
+                        )
+                    })?;
+                DefaultTokenSourceProvider::new_with_credentials(auth_cfg, Box::new(credentials))
+                    .await
+                    .map_err(|e| {
+                        connector_err!(
+                            External,
+                            WithBackoff,
+                            "failed to initialize BigQuery auth with service account JSON: {e}"
+                        )
+                    })?
+            } else {
+                DefaultTokenSourceProvider::new(auth_cfg).await.map_err(|e| {
+                    connector_err!(
+                        External,
+                        WithBackoff,
+                        "failed to initialize BigQuery auth via ADC: {e}"
+                    )
+                })?
+            }
+        } else {
+            DefaultTokenSourceProvider::new(auth_cfg).await.map_err(|e| {
+                connector_err!(
+                    External,
+                    WithBackoff,
+                    "failed to initialize BigQuery auth via ADC: {e}"
+                )
+            })?
+        };
+        self.token_provider = Some(provider);
         Ok(())
     }
 

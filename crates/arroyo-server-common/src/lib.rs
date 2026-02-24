@@ -7,9 +7,11 @@ pub mod tls;
 use anyhow::anyhow;
 use arroyo_types::TELEMETRY_KEY;
 use axum::Router;
+use axum::body::Body;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::http::header::AUTHORIZATION;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use lazy_static::lazy_static;
@@ -348,7 +350,25 @@ pub async fn start_admin_server(service: &str) -> anyhow::Result<()> {
         .with_state(state);
 
     if let ApiAuthMode::StaticApiKey { api_key } = &config.admin.auth_mode {
-        app = app.layer(ValidateRequestHeaderLayer::bearer(api_key));
+        let expected_auth_header = format!("Bearer {api_key}");
+        app = app.layer(ValidateRequestHeaderLayer::custom(
+            move |request: &mut http::Request<_>| {
+                let authorized = request
+                    .headers()
+                    .get(AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v == expected_auth_header)
+                    .unwrap_or(false);
+
+                if authorized {
+                    Ok(())
+                } else {
+                    let mut response = http::Response::new(Body::empty());
+                    *response.status_mut() = StatusCode::UNAUTHORIZED;
+                    Err(response)
+                }
+            },
+        ));
     };
 
     let tls_config =

@@ -2,8 +2,10 @@
 #![allow(clippy::needless_lifetimes)]
 
 use axum::Json;
+use axum::body::Body;
 use axum::response::IntoResponse;
 use cornucopia_async::DatabaseSource;
+use http::header::AUTHORIZATION;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -148,7 +150,25 @@ pub async fn start_server(database: DatabaseSource, guard: ShutdownGuard) -> any
     );
 
     if let ApiAuthMode::StaticApiKey { api_key } = &config.api.auth_mode {
-        app = app.layer(ValidateRequestHeaderLayer::bearer(api_key));
+        let expected_auth_header = format!("Bearer {api_key}");
+        app = app.layer(ValidateRequestHeaderLayer::custom(
+            move |request: &mut http::Request<_>| {
+                let authorized = request
+                    .headers()
+                    .get(AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v == expected_auth_header)
+                    .unwrap_or(false);
+
+                if authorized {
+                    Ok(())
+                } else {
+                    let mut response = http::Response::new(Body::empty());
+                    *response.status_mut() = StatusCode::UNAUTHORIZED;
+                    Err(response)
+                }
+            },
+        ));
     };
 
     let tls_config =
