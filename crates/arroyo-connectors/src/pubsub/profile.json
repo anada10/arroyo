@@ -3,7 +3,17 @@
   "title": "PubSubConfig",
   "properties": {
     "project_id": { "type": "string", "title": "Project ID" },
-    "endpoint": { "type": ["string", "null"], "title": "Custom Endpoint", "description": "Optional emulator or override endpoint" }
+    "endpoint": {
+      "type": "string",
+      "title": "Custom Endpoint",
+      "description": "Optional emulator or override endpoint"
+    },
+    "service_account_json": {
+      "type": "string",
+      "title": "Service Account JSON",
+      "description": "Optional service account credentials JSON. If omitted, uses Application Default Credentials (GOOGLE_APPLICATION_CREDENTIALS / gcloud ADC).",
+      "maxLength": 10000
+    }
   },
   "required": ["project_id"]
 }

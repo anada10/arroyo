@@ -7,6 +7,7 @@ use arroyo_rpc::formats::{BadData, Format, Framing};
 use arroyo_rpc::grpc::rpc::StopMode;
 use async_trait::async_trait;
 use futures::StreamExt;
+use google_cloud_pubsub::client::google_cloud_auth::credentials::CredentialsFile;
 use google_cloud_pubsub::client::{Client, ClientConfig};
 use google_cloud_pubsub::subscription::MessageStream;
 use std::time::SystemTime;
@@ -15,6 +16,7 @@ use tokio::select;
 pub struct PubSubSourceFunc {
     pub project_id: String,
     pub endpoint: Option<String>,
+    pub service_account_json: Option<String>,
     pub subscription: String,
     pub format: Format,
     pub framing: Option<Framing>,
@@ -23,14 +25,29 @@ pub struct PubSubSourceFunc {
 
 impl PubSubSourceFunc {
     async fn new_stream(&self) -> DataflowResult<MessageStream> {
-        let mut cfg = ClientConfig::default()
-            .with_auth()
-            .await
-            .map_err(|e| connector_err!(External, WithBackoff, "failed to configure Pub/Sub auth: {e}"))?;
+        let mut cfg = ClientConfig::default();
         if let Some(e) = &self.endpoint {
             cfg.endpoint = e.clone();
         }
         cfg.project_id = Some(self.project_id.clone());
+        let cfg = if let Some(service_account_json) = self.service_account_json.as_deref() {
+            if !service_account_json.trim().is_empty() {
+                let credentials = CredentialsFile::new_from_str(service_account_json)
+                    .await
+                    .map_err(|e| connector_err!(User, NoRetry, "invalid Pub/Sub service account JSON: {e}"))?;
+                cfg.with_credentials(credentials)
+                    .await
+                    .map_err(|e| connector_err!(External, WithBackoff, "failed to configure Pub/Sub auth with service account JSON: {e}"))?
+            } else {
+                cfg.with_auth()
+                    .await
+                    .map_err(|e| connector_err!(External, WithBackoff, "failed to configure Pub/Sub auth: {e}"))?
+            }
+        } else {
+            cfg.with_auth()
+                .await
+                .map_err(|e| connector_err!(External, WithBackoff, "failed to configure Pub/Sub auth: {e}"))?
+        };
         let client = Client::new(cfg)
             .await
             .map_err(|e| connector_err!(External, WithBackoff, "failed to initialize Pub/Sub client: {e}"))?;

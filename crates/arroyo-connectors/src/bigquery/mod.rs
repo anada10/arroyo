@@ -29,8 +29,14 @@ pub struct BigQueryConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct BigQueryTable {
-    pub dataset: String,
-    pub table: String,
+    #[serde(default)]
+    pub dataset: Option<String>,
+    #[serde(default)]
+    pub table: Option<String>,
+    #[serde(default)]
+    pub dataset_field: Option<String>,
+    #[serde(default)]
+    pub table_field: Option<String>,
     #[serde(default)]
     pub use_storage_write: Option<bool>,
     #[serde(default)]
@@ -162,14 +168,26 @@ impl BigQueryConnector {
     }
 
     pub fn table_from_options(options: &mut ConnectorOptions) -> anyhow::Result<BigQueryTable> {
-        let dataset = options.pull_str("dataset")?;
-        let table = options.pull_str("table")?;
+        let dataset = options.pull_opt_str("dataset")?;
+        let table = options.pull_opt_str("table")?;
+        let dataset_field = options.pull_opt_field("dataset_field")?;
+        let table_field = options.pull_opt_field("table_field")?;
         let use_storage_write = options.pull_opt_bool("use_storage_write")?;
         let insert_id_field = options.pull_opt_field("insert_id_field")?;
         let max_batch_bytes = options.pull_opt_i64("max_batch_bytes")?;
         let max_batch_rows = options.pull_opt_i64("max_batch_rows")?;
         let flush_interval_millis = options.pull_opt_i64("flush_interval_millis")?;
-        Ok(BigQueryTable { dataset, table, use_storage_write, insert_id_field, max_batch_bytes, max_batch_rows, flush_interval_millis })
+        Ok(BigQueryTable {
+            dataset,
+            table,
+            dataset_field,
+            table_field,
+            use_storage_write,
+            insert_id_field,
+            max_batch_bytes,
+            max_batch_rows,
+            flush_interval_millis,
+        })
     }
 }
 
@@ -207,7 +225,20 @@ async fn test_connection(config: &BigQueryConfig, table: &BigQueryTable) -> anyh
         .map_err(|e| anyhow!("failed to fetch BigQuery access token: {e}"))?;
 
     // During profile-only validation, table fields may not be provided yet.
-    if table.dataset.trim().is_empty() || table.table.trim().is_empty() {
+    if table
+        .dataset
+        .as_deref()
+        .map(|d| d.trim().is_empty())
+        .unwrap_or(true)
+        || table
+            .table
+            .as_deref()
+            .map(|d| d.trim().is_empty())
+            .unwrap_or(true)
+    {
+        if table.dataset_field.is_some() || table.table_field.is_some() {
+            return Ok("Authenticated to BigQuery successfully (dynamic dataset/table enabled)".into());
+        }
         return Ok("Authenticated to BigQuery successfully".into());
     }
 
@@ -217,7 +248,10 @@ async fn test_connection(config: &BigQueryConfig, table: &BigQueryTable) -> anyh
         .unwrap_or_else(|| "https://bigquery.googleapis.com".to_string());
     let url = format!(
         "{}/bigquery/v2/projects/{}/datasets/{}/tables/{}",
-        base, config.project_id, table.dataset, table.table
+        base,
+        config.project_id,
+        table.dataset.as_deref().unwrap_or_default(),
+        table.table.as_deref().unwrap_or_default()
     );
 
     let response = reqwest::Client::new()
@@ -230,7 +264,8 @@ async fn test_connection(config: &BigQueryConfig, table: &BigQueryTable) -> anyh
     if response.status().is_success() {
         Ok(format!(
             "Authenticated and verified table {}.{}",
-            table.dataset, table.table
+            table.dataset.as_deref().unwrap_or_default(),
+            table.table.as_deref().unwrap_or_default()
         ))
     } else {
         let status = response.status();
@@ -238,8 +273,8 @@ async fn test_connection(config: &BigQueryConfig, table: &BigQueryTable) -> anyh
         Err(anyhow!(
             "BigQuery API returned {} while checking table {}.{}: {}",
             status,
-            table.dataset,
-            table.table,
+            table.dataset.as_deref().unwrap_or_default(),
+            table.table.as_deref().unwrap_or_default(),
             body
         ))
     }

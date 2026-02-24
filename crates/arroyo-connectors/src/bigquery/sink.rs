@@ -15,7 +15,7 @@ use google_cloud_token::TokenSourceProvider;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use super::BigQueryTable;
@@ -52,15 +52,17 @@ impl BatchBuffer {
 
 pub struct BigQuerySinkFunc {
     project_id: String,
-    dataset: String,
-    table: String,
+    dataset: Option<String>,
+    table: Option<String>,
+    dataset_field: Option<String>,
+    table_field: Option<String>,
     insert_id_field: Option<String>,
     client: Client,
     token_provider: Option<DefaultTokenSourceProvider>,
     service_account_json: Option<String>,
     endpoint: Option<String>,
     serializer: ArrowSerializer,
-    buffer: BatchBuffer,
+    buffers: HashMap<Destination, BatchBuffer>,
     flush_config: FlushConfig,
 }
 
@@ -71,27 +73,37 @@ impl BigQuerySinkFunc {
             project_id: cfg.project_id,
             dataset: table.dataset,
             table: table.table,
+            dataset_field: table.dataset_field,
+            table_field: table.table_field,
             insert_id_field: table.insert_id_field.clone(),
             client: Client::new(),
             token_provider: None,
             service_account_json: cfg.service_account_json,
             endpoint: cfg.endpoint,
             serializer: ArrowSerializer::new(op.format.expect("format required")),
-            buffer: BatchBuffer::new(),
+            buffers: HashMap::new(),
             flush_config,
         }
     }
 
-    fn make_url(&self) -> String {
+    fn make_url(&self, destination: &Destination) -> String {
         let base = self.endpoint.clone().unwrap_or_else(|| "https://bigquery.googleapis.com".to_string());
-        format!("{}/bigquery/v2/projects/{}/datasets/{}/tables/{}/insertAll", base, self.project_id, self.dataset, self.table)
+        format!(
+            "{}/bigquery/v2/projects/{}/datasets/{}/tables/{}/insertAll",
+            base, self.project_id, destination.dataset, destination.table
+        )
     }
 
-    async fn flush_with_retries(&mut self, ctx: &mut OperatorContext) -> DataflowResult<()> {
-        if self.buffer.rows.is_empty() {
+    async fn flush_destination_with_retries(
+        &self,
+        destination: &Destination,
+        buffer: &mut BatchBuffer,
+        ctx: &mut OperatorContext,
+    ) -> DataflowResult<()> {
+        if buffer.rows.is_empty() {
             return Ok(());
         }
-        let url = self.make_url();
+        let url = self.make_url(destination);
         #[derive(Serialize)]
         struct Row<'a> {
             #[serde(rename = "insertId", skip_serializing_if = "Option::is_none")]
@@ -102,8 +114,8 @@ impl BigQuerySinkFunc {
         struct Payload<'a> { kind: &'static str, rows: Vec<Row<'a>> }
 
         // Serialize rows to JSON objects expected by BigQuery insertAll.
-        let mut payload_rows = Vec::with_capacity(self.buffer.rows.len());
-        for (insert_id, v) in &self.buffer.rows {
+        let mut payload_rows = Vec::with_capacity(buffer.rows.len());
+        for (insert_id, v) in &buffer.rows {
             // v is bytes of a single record in selected format; for BigQuery streaming, JSON is expected.
             // We assume JSON output format was chosen.
             let value: serde_json::Value = match serde_json::from_slice(v) {
@@ -120,7 +132,7 @@ impl BigQuerySinkFunc {
         }
         let payload = Payload { kind: "bigquery#tableDataInsertAllRequest", rows: payload_rows };
         if payload.rows.is_empty() {
-            self.buffer.mark_flushed();
+            buffer.mark_flushed();
             return Ok(());
         }
 
@@ -143,7 +155,7 @@ impl BigQuerySinkFunc {
             match resp {
                 Ok(r) => {
                     if r.status().is_success() {
-                        self.buffer.mark_flushed();
+                        buffer.mark_flushed();
                         return Ok(());
                     } else {
                         let status = r.status();
@@ -158,10 +170,72 @@ impl BigQuerySinkFunc {
 
             attempts += 1;
             if attempts >= 20 {
-                return Err(connector_err!(External, WithBackoff, "exhausted retries writing to BigQuery '{}.{}'", self.dataset, self.table));
+                return Err(connector_err!(
+                    External,
+                    WithBackoff,
+                    "exhausted retries writing to BigQuery '{}.{}'",
+                    destination.dataset,
+                    destination.table
+                ));
             }
             tokio::time::sleep(Duration::from_millis((50 * (1 << attempts)).min(2_000))).await;
         }
+    }
+
+    fn resolve_destination(&self, row: &serde_json::Value) -> Result<Destination, String> {
+        let row_obj = row
+            .as_object()
+            .ok_or_else(|| "record must serialize to a JSON object for BigQuery sink".to_string())?;
+
+        let dataset = if let Some(field) = &self.dataset_field {
+            match row_obj.get(field).and_then(|v| v.as_str()) {
+                Some(v) if !v.trim().is_empty() => v.to_string(),
+                _ => {
+                    return Err(format!(
+                        "dataset_field '{}' is missing or not a non-empty string",
+                        field
+                    ))
+                }
+            }
+        } else {
+            self.dataset
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| "dataset must be configured (static or dataset_field)".to_string())?
+                .to_string()
+        };
+
+        let table = if let Some(field) = &self.table_field {
+            match row_obj.get(field).and_then(|v| v.as_str()) {
+                Some(v) if !v.trim().is_empty() => v.to_string(),
+                _ => return Err(format!("table_field '{}' is missing or not a non-empty string", field)),
+            }
+        } else {
+            self.table
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| "table must be configured (static or table_field)".to_string())?
+                .to_string()
+        };
+
+        Ok(Destination { dataset, table })
+    }
+
+    async fn flush_destination(
+        &mut self,
+        destination: Destination,
+        ctx: &mut OperatorContext,
+    ) -> DataflowResult<()> {
+        if let Some(mut buffer) = self.buffers.remove(&destination) {
+            self.flush_destination_with_retries(&destination, &mut buffer, ctx)
+                .await?;
+            if !buffer.rows.is_empty() {
+                self.buffers.insert(destination, buffer);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -170,13 +244,50 @@ enum InsertIdColumn<'a> {
     LargeUtf8(&'a LargeStringArray),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Destination {
+    dataset: String,
+    table: String,
+}
+
 #[async_trait]
 impl ArrowOperator for BigQuerySinkFunc {
-    fn name(&self) -> String { format!("bigquery-sink-{}.{}", self.dataset, self.table) }
+    fn name(&self) -> String {
+        format!(
+            "bigquery-sink-{}.{}",
+            self.dataset.as_deref().unwrap_or("<dynamic>"),
+            self.table.as_deref().unwrap_or("<dynamic>")
+        )
+    }
 
     fn tables(&self) -> HashMap<String, TableConfig> { HashMap::new() }
 
     async fn on_start(&mut self, _ctx: &mut OperatorContext) -> DataflowResult<()> {
+        let dataset_static = self
+            .dataset
+            .as_deref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        let table_static = self
+            .table
+            .as_deref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        if self.dataset_field.is_none() && !dataset_static {
+            return Err(connector_err!(
+                User,
+                NoRetry,
+                "BigQuery sink requires either 'dataset' or 'dataset_field'"
+            ));
+        }
+        if self.table_field.is_none() && !table_static {
+            return Err(connector_err!(
+                User,
+                NoRetry,
+                "BigQuery sink requires either 'table' or 'table_field'"
+            ));
+        }
+
         let auth_cfg = AuthConfig {
             audience: None,
             scopes: Some(&["https://www.googleapis.com/auth/bigquery"][..]),
@@ -233,6 +344,7 @@ impl ArrowOperator for BigQuerySinkFunc {
     ) -> DataflowResult<()> {
         // For high throughput, buffer and flush by size/time/row count.
         let values = self.serializer.serialize(&batch);
+        let mut destinations_to_flush: HashSet<Destination> = HashSet::new();
         let insert_idx = self
             .insert_id_field
             .as_ref()
@@ -255,6 +367,20 @@ impl ArrowOperator for BigQuerySinkFunc {
         };
 
         for (i, row) in values.enumerate() {
+            let row_value: serde_json::Value = match serde_json::from_slice(&row) {
+                Ok(v) => v,
+                Err(e) => {
+                    ctx.report_error("BigQuery JSON error", format!("{e:?}")).await;
+                    continue;
+                }
+            };
+            let destination = match self.resolve_destination(&row_value) {
+                Ok(d) => d,
+                Err(e) => {
+                    ctx.report_error("BigQuery destination error", e).await;
+                    continue;
+                }
+            };
             let insert_id = match &insert_col {
                 Some(InsertIdColumn::Utf8(col)) if !col.is_null(i) => Some(col.value(i).to_string()),
                 Some(InsertIdColumn::LargeUtf8(col)) if !col.is_null(i) => {
@@ -262,10 +388,18 @@ impl ArrowOperator for BigQuerySinkFunc {
                 }
                 _ => None,
             };
-            self.buffer.add(insert_id, row);
-            if self.buffer.should_flush(&self.flush_config) {
-                self.flush_with_retries(ctx).await?;
+            let buffer = self
+                .buffers
+                .entry(destination.clone())
+                .or_insert_with(BatchBuffer::new);
+            buffer.add(insert_id, row);
+            if buffer.should_flush(&self.flush_config) {
+                destinations_to_flush.insert(destination);
             }
+        }
+
+        for destination in destinations_to_flush {
+            self.flush_destination(destination, ctx).await?;
         }
         Ok(())
     }
@@ -276,7 +410,11 @@ impl ArrowOperator for BigQuerySinkFunc {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
-        self.flush_with_retries(ctx).await
+        let destinations: Vec<Destination> = self.buffers.keys().cloned().collect();
+        for destination in destinations {
+            self.flush_destination(destination, ctx).await?;
+        }
+        Ok(())
     }
 }
 

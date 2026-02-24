@@ -4,8 +4,10 @@ use arroyo_operator::connector::{Connection, Connector};
 use arroyo_operator::operator::ConstructedOperator;
 use arroyo_rpc::api_types::connections::{ConnectionProfile, ConnectionSchema, ConnectionType, TestSourceMessage};
 use arroyo_rpc::{ConnectorOptions, OperatorConfig};
+use google_cloud_pubsub::client::google_cloud_auth::credentials::CredentialsFile;
+use google_cloud_pubsub::client::{Client, ClientConfig};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::mpsc::Sender;
 
 mod sink;
@@ -20,21 +22,63 @@ pub struct PubSubConfig {
     pub project_id: String,
     #[serde(default)]
     pub endpoint: Option<String>,
+    #[serde(default)]
+    pub service_account_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type")]
+#[serde(untagged)]
 pub enum TableType {
-    #[serde(rename = "source")]
     Source { subscription: String },
-    #[serde(rename = "sink")]
     Sink { topic: String },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct PubSubTable {
     #[serde(rename = "type")]
     pub type_: TableType,
+}
+
+impl<'de> Deserialize<'de> for PubSubTable {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Nested {
+                #[serde(rename = "type")]
+                type_: TableType,
+            },
+            LegacySource {
+                #[serde(rename = "type")]
+                type_: String,
+                subscription: String,
+            },
+            LegacySink {
+                #[serde(rename = "type")]
+                type_: String,
+                topic: String,
+            },
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Nested { type_ } => Ok(Self { type_ }),
+            Repr::LegacySource {
+                type_,
+                subscription,
+            } if type_.eq_ignore_ascii_case("source") => Ok(Self {
+                type_: TableType::Source { subscription },
+            }),
+            Repr::LegacySink { type_, topic } if type_.eq_ignore_ascii_case("sink") => Ok(Self {
+                type_: TableType::Sink { topic },
+            }),
+            _ => Err(serde::de::Error::custom(
+                "invalid Pub/Sub table config; expected source/subscription or sink/topic",
+            )),
+        }
+    }
 }
 
 pub struct PubSubConnector {}
@@ -72,14 +116,26 @@ impl Connector for PubSubConnector {
     fn test(
         &self,
         _name: &str,
-        _config: Self::ProfileT,
-        _table: Self::TableT,
+        config: Self::ProfileT,
+        table: Self::TableT,
         _schema: Option<&ConnectionSchema>,
         tx: Sender<TestSourceMessage>,
     ) {
         tokio::spawn(async move {
+            let msg = match test_connection(&config, &table).await {
+                Ok(message) => TestSourceMessage {
+                    error: false,
+                    done: true,
+                    message,
+                },
+                Err(e) => TestSourceMessage {
+                    error: true,
+                    done: true,
+                    message: format!("Pub/Sub validation failed: {e}"),
+                },
+            };
             let _ = tx
-                .send(TestSourceMessage { error: false, done: true, message: "Successfully validated Pub/Sub connection".to_string() })
+                .send(msg)
                 .await;
         });
     }
@@ -151,6 +207,7 @@ impl Connector for PubSubConnector {
                 ConstructedOperator::from_source(Box::new(source::PubSubSourceFunc {
                     project_id: profile.project_id,
                     endpoint: profile.endpoint,
+                    service_account_json: profile.service_account_json,
                     subscription,
                     format: config.format.expect("Format must be set for Pub/Sub source"),
                     framing: config.framing,
@@ -161,6 +218,7 @@ impl Connector for PubSubConnector {
                 ConstructedOperator::from_operator(Box::new(sink::PubSubSinkFunc {
                     project_id: profile.project_id,
                     endpoint: profile.endpoint,
+                    service_account_json: profile.service_account_json,
                     topic,
                     publisher: None,
                     serializer: ArrowSerializer::new(config.format.expect("Format must be set for Pub/Sub sink")),
@@ -174,15 +232,106 @@ impl PubSubConnector {
     pub fn connection_from_options(options: &mut ConnectorOptions) -> anyhow::Result<PubSubConfig> {
         let project_id = arroyo_rpc::ConnectorOptions::pull_str(options, "project_id")?;
         let endpoint = options.pull_opt_str("endpoint")?;
-        Ok(PubSubConfig { project_id, endpoint })
+        let service_account_json = options.pull_opt_str("service_account_json")?;
+        Ok(PubSubConfig {
+            project_id,
+            endpoint,
+            service_account_json,
+        })
     }
 
     pub fn table_from_options(options: &mut ConnectorOptions) -> anyhow::Result<PubSubTable> {
         if let Some(subscription) = options.pull_opt_str("subscription")? {
-            Ok(PubSubTable { type_: TableType::Source { subscription } })
+            return Ok(PubSubTable {
+                type_: TableType::Source { subscription },
+            });
+        }
+        if let Some(subscription) = options.pull_opt_str("type.subscription")? {
+            return Ok(PubSubTable {
+                type_: TableType::Source { subscription },
+            });
+        }
+        if let Some(subscription) = options.pull_opt_str("source.subscription")? {
+            return Ok(PubSubTable {
+                type_: TableType::Source { subscription },
+            });
+        }
+
+        if let Some(topic) = options.pull_opt_str("topic")? {
+            return Ok(PubSubTable {
+                type_: TableType::Sink { topic },
+            });
+        }
+        if let Some(topic) = options.pull_opt_str("type.topic")? {
+            return Ok(PubSubTable {
+                type_: TableType::Sink { topic },
+            });
+        }
+        if let Some(topic) = options.pull_opt_str("sink.topic")? {
+            return Ok(PubSubTable {
+                type_: TableType::Sink { topic },
+            });
+        }
+
+        Err(anyhow!(
+            "Pub/Sub table config must include either subscription (source) or topic (sink)"
+        ))
+    }
+}
+
+async fn pubsub_client(config: &PubSubConfig) -> anyhow::Result<Client> {
+    let mut cfg = ClientConfig::default();
+    if let Some(endpoint) = &config.endpoint {
+        cfg.endpoint = endpoint.clone();
+    }
+    cfg.project_id = Some(config.project_id.clone());
+
+    let cfg = if let Some(service_account_json) = config.service_account_json.as_deref() {
+        if !service_account_json.trim().is_empty() {
+            let credentials = CredentialsFile::new_from_str(service_account_json)
+                .await
+                .map_err(|e| anyhow!("invalid service account JSON: {e}"))?;
+            cfg.with_credentials(credentials)
+                .await
+                .map_err(|e| anyhow!("failed to configure Pub/Sub auth with service account JSON: {e}"))?
         } else {
-            let topic = options.pull_str("topic")?;
-            Ok(PubSubTable { type_: TableType::Sink { topic } })
+            cfg.with_auth()
+                .await
+                .map_err(|e| anyhow!("failed to configure Pub/Sub auth via ADC: {e}"))?
+        }
+    } else {
+        cfg.with_auth()
+            .await
+            .map_err(|e| anyhow!("failed to configure Pub/Sub auth via ADC: {e}"))?
+    };
+
+    Client::new(cfg).await.map_err(|e| anyhow!("failed to initialize Pub/Sub client: {e}"))
+}
+
+async fn test_connection(config: &PubSubConfig, table: &PubSubTable) -> anyhow::Result<String> {
+    let client = pubsub_client(config).await?;
+    match &table.type_ {
+        TableType::Source { subscription } => {
+            let sub = client.subscription(subscription);
+            let exists = sub
+                .exists(None)
+                .await
+                .map_err(|e| anyhow!("failed to check subscription '{}': {e}", subscription))?;
+            if !exists {
+                return Err(anyhow!("subscription '{}' does not exist", subscription));
+            }
+            Ok(format!("Authenticated and verified subscription '{subscription}'"))
+        }
+        TableType::Sink { topic } => {
+            let topic_ref = client.topic(topic);
+            let exists = topic_ref
+                .exists(None)
+                .await
+                .map_err(|e| anyhow!("failed to check topic '{}': {e}", topic))?;
+            if !exists {
+                return Err(anyhow!("topic '{}' does not exist", topic));
+            }
+            Ok(format!("Authenticated and verified topic '{topic}'"))
         }
     }
 }

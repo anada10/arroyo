@@ -1,28 +1,40 @@
 {
   "type": "object",
   "title": "PubSubTable",
-  "oneOf": [
-    {
-      "title": "Source",
-      "type": "object",
-      "properties": {
-        "type": { "const": "source" },
-        "subscription": { "type": "string", "title": "Subscription" }
-      },
-      "required": ["type", "subscription"],
-      "additionalProperties": false
-    },
-    {
-      "title": "Sink",
-      "type": "object",
-      "properties": {
-        "type": { "const": "sink" },
-        "topic": { "type": "string", "title": "Topic" }
-      },
-      "required": ["type", "topic"],
-      "additionalProperties": false
+  "properties": {
+    "type": {
+      "title": "Table Type",
+      "oneOf": [
+        {
+          "title": "Source",
+          "type": "object",
+          "properties": {
+            "subscription": {
+              "type": "string",
+              "title": "Subscription",
+              "description": "Pub/Sub subscription name to consume from"
+            }
+          },
+          "required": ["subscription"],
+          "additionalProperties": false
+        },
+        {
+          "title": "Sink",
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string",
+              "title": "Topic",
+              "description": "Pub/Sub topic name to publish to"
+            }
+          },
+          "required": ["topic"],
+          "additionalProperties": false
+        }
+      ]
     }
-  ]
+  },
+  "required": ["type"]
 }
 
 

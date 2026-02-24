@@ -2,15 +2,32 @@
   "type": "object",
   "title": "BigQueryTable",
   "properties": {
-    "dataset": { "type": "string", "title": "Dataset" },
-    "table": { "type": "string", "title": "Table" },
+    "dataset": {
+      "type": "string",
+      "title": "Dataset (Static)",
+      "description": "Optional static dataset. If omitted, set Dataset Field for dynamic routing."
+    },
+    "table": {
+      "type": "string",
+      "title": "Table (Static)",
+      "description": "Optional static table. If omitted, set Table Field for dynamic routing."
+    },
+    "dataset_field": {
+      "type": ["string", "null"],
+      "title": "Dataset Field",
+      "description": "Optional field name in each row that contains the destination dataset."
+    },
+    "table_field": {
+      "type": ["string", "null"],
+      "title": "Table Field",
+      "description": "Optional field name in each row that contains the destination table."
+    },
     "use_storage_write": { "type": ["boolean", "null"], "title": "Use Storage Write API", "default": true },
     "insert_id_field": { "type": ["string", "null"], "title": "Insert ID Field", "description": "Optional field name to use as insertId for de-duplication" },
     "max_batch_bytes": { "type": ["integer", "null"], "title": "Max Batch Bytes", "default": 8000000 },
     "max_batch_rows": { "type": ["integer", "null"], "title": "Max Batch Rows", "default": 5000 },
     "flush_interval_millis": { "type": ["integer", "null"], "title": "Flush Interval (ms)", "default": 500 }
-  },
-  "required": ["dataset", "table"]
+  }
 }
 
 
